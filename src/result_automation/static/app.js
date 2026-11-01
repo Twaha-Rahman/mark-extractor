@@ -42,7 +42,7 @@ const clone = object => JSON.parse(JSON.stringify(object));
 function fillIcons(root = document) { root.querySelectorAll("[data-icon]").forEach(node => node.innerHTML = icon(node.dataset.icon)); }
 fillIcons();
 
-const state = {doc: null, documents: [], page: 1, selected: null, filter: "all", query: "", drafts: new Map(), selection: null,
+const state = {doc: null, documents: [], page: 1, selected: null, filter: "all", sort: "source", query: "", lowConfidence: .7, drafts: new Map(), selection: null,
   drag: null, zoom: false, mutating: false, exporting: false, openToken: 0, poll: null, editId: null, editNew: false};
 
 function toast(message, error = false) {
@@ -189,7 +189,11 @@ function applyDocument(doc) {
   $("verifiedRows").textContent = doc.verified_count;
   $("allCount").textContent = doc.row_count;
   $("reviewCount").textContent = doc.review_count;
+  $("confidenceCount").textContent = doc.records.filter(needsConfidenceReview).length;
   $("maxMark").value = doc.max_mark ?? "";
+  $("absentCodes").value = (doc.absent_codes || []).join(", ");
+  $("allowFractions").checked = doc.allow_fractions !== false;
+  $("sortRows").value = state.sort;
   $("pageSelect").innerHTML = doc.pages.map(page => `<option value="${page.number}">Page ${page.number} of ${doc.page_count}</option>`).join("");
   $("warnings").hidden = !doc.warnings.length;
   $("warnings").innerHTML = doc.warnings.map(warning => `<span>${escapeHTML(warning)}</span>`).join("");
@@ -210,7 +214,7 @@ function renderProgress(doc) {
   $("cancelJob").disabled = doc.status === "cancelling";
   $("retryUpload").hidden = !(failed || cancelled);
   $("removeFailed").hidden = !(failed || cancelled);
-  $("progressNote").textContent = failed ? "Try an upright, clear PDF or image. Your original file has not been changed." : cancelled ? "You can upload another document whenever you’re ready." : "You can leave this page open. Your document will appear here when it’s ready.";
+  $("progressNote").textContent = failed && /password/i.test(doc.error || "") ? "Use the upload dialog again and enter the PDF password there." : failed ? "Try an upright, clear PDF or image. Your original file has not been changed." : cancelled ? "You can upload another document whenever you’re ready." : "You can leave this page open. Your document will appear here when it’s ready.";
 }
 
 async function importFile(file) {
@@ -219,7 +223,8 @@ async function importFile(file) {
   if (!/\.(pdf|png|jpe?g|tiff?|bmp|webp)$/i.test(file.name)) { toast("Choose a PDF, PNG, JPEG, TIFF, BMP, or WebP file.", true); return; }
   if ($("uploadDialog").open) $("uploadDialog").close();
   const form = new FormData(); form.append("file", file); form.append("force_ocr", $("forceOCR").checked);
-  $("forceOCR").checked = false;
+  if ($("pdfPassword").value) form.append("password", $("pdfPassword").value);
+  $("forceOCR").checked = false; $("pdfPassword").value = "";
   clearTimeout(state.poll); state.openToken++; state.drafts.clear();
   view("progressView");
   $("titleText").textContent = file.name; $("titleDescription").textContent = "Adding your document to the local workspace…";
@@ -234,21 +239,37 @@ async function importFile(file) {
 
 function currentPage() { return state.doc?.pages?.[state.page - 1]; }
 function currentRow() { return state.doc?.records?.find(row => row.id === state.selected); }
-function filteredRows() { return (state.doc?.records || []).filter(row => (!state.query || row.roll.includes(state.query)) && (state.filter !== "review" || row.issues.length)); }
+function isLowConfidence(row) { return row.method === "Local OCR" && Number(row.confidence ?? 1) < state.lowConfidence; }
+function needsConfidenceReview(row) { return isLowConfidence(row) && !row.reviewed; }
+function filteredRows() {
+  let rows = (state.doc?.records || []).filter(row => (!state.query || row.roll.includes(state.query))
+    && (state.filter !== "review" || row.issues.length)
+    && (state.filter !== "confidence" || needsConfidenceReview(row)));
+  if (state.sort === "confidence") rows = [...rows].sort((a, b) => Number(a.confidence ?? 1) - Number(b.confidence ?? 1) || a.roll.localeCompare(b.roll));
+  return rows;
+}
 
 function renderRows() {
   if (state.doc?.status !== "ready") return;
   const rows = filteredRows();
   $("filterAll").classList.toggle("active", state.filter === "all");
   $("filterReview").classList.toggle("active", state.filter === "review");
-  $("tableBody").innerHTML = rows.map(row => `<tr data-row="${row.id}" tabindex="0" aria-selected="${row.id === state.selected}" class="${row.id === state.selected ? "selected" : ""}"><td>${escapeHTML(row.roll || "—")}</td><td>${escapeHTML(row.mark || "—")}</td><td><span class="row-status ${row.issues.length ? "needs-review" : row.reviewed ? "reviewed" : ""}" title="${escapeHTML(row.issues.join("; "))}">${escapeHTML(row.status)}</span></td><td><button class="icon-button" data-edit="${row.id}" aria-label="Edit roll ${escapeHTML(row.roll || "blank")}">${icon("edit")}</button></td></tr>`).join("");
+  $("filterConfidence").classList.toggle("active", state.filter === "confidence");
+  $("tableBody").innerHTML = rows.map(row => {
+    const low = needsConfidenceReview(row);
+    const confidence = low ? `<span class="confidence-chip" title="Local OCR confidence ${Number(row.confidence).toFixed(2)}">${Math.round(Number(row.confidence) * 100)}%</span>` : "";
+    const verify = row.reviewed
+      ? `<button class="row-verify done" disabled title="This row is already reviewed" aria-label="Already reviewed">${icon("check")}</button>`
+      : `<button class="row-verify" data-verify="${row.id}" title="Mark this row reviewed (R)" aria-label="Mark roll ${escapeHTML(row.roll || "blank")} reviewed" aria-keyshortcuts="R">${icon("check")}</button>`;
+    return `<tr data-row="${row.id}" tabindex="0" aria-selected="${row.id === state.selected}" class="${row.id === state.selected ? "selected" : ""}${low ? " low-confidence" : ""}"><td>${escapeHTML(row.roll || "—")}</td><td>${escapeHTML(row.mark || "—")}</td><td><span class="row-status ${row.issues.length ? "needs-review" : row.reviewed ? "reviewed" : ""}" title="${escapeHTML(row.issues.join("; "))}">${escapeHTML(row.status)}</span>${confidence}</td><td>${verify}</td><td><button class="icon-button" data-edit="${row.id}" aria-label="Edit roll ${escapeHTML(row.roll || "blank")}">${icon("edit")}</button></td></tr>`;
+  }).join("");
   $("emptyRows").hidden = rows.length > 0;
-  $("emptyRowsMessage").textContent = !state.doc.records.length ? "Select the roll and marks columns on the source, then re-extract the page." : state.filter === "review" && !state.query ? "No rows currently need review." : "Try a different roll number or change the filter.";
+  $("emptyRowsMessage").textContent = !state.doc.records.length ? "Select the roll and marks columns on the source, then re-extract the page." : state.filter === "review" && !state.query ? "No rows currently need review." : state.filter === "confidence" ? "No rows are below the confidence threshold." : "Try a different roll number or change the filter.";
   $("visibleCount").textContent = `Showing ${rows.length} of ${state.doc.row_count} rows`;
   renderDetail();
 }
 
-function selectRow(id, scroll = false) {
+function selectRow(id, scroll = false, focus = false) {
   const row = state.doc?.records.find(record => record.id === id);
   if (!row) return;
   state.selected = id;
@@ -256,7 +277,21 @@ function selectRow(id, scroll = false) {
   state.page = row.page;
   renderRows(); renderPage();
   if (changedPage) $("pageViewport").scrollTop = 0;
-  if (scroll) $("tableBody").querySelector(`[data-row="${CSS.escape(id)}"]`)?.scrollIntoView({block:"nearest"});
+  const element = $("tableBody").querySelector(`[data-row="${CSS.escape(id)}"]`);
+  if (scroll) element?.scrollIntoView({block:"nearest"});
+  if (focus) element?.focus({preventScroll:true});
+}
+
+function moveSelection(position) {
+  const rows = filteredRows();
+  if (!rows.length) return;
+  const current = rows.findIndex(row => row.id === state.selected);
+  let index = current;
+  if (position === "first") index = 0;
+  else if (position === "last") index = rows.length - 1;
+  else if (position === "next") index = current < 0 ? 0 : Math.min(current + 1, rows.length - 1);
+  else if (position === "previous") index = current < 0 ? rows.length - 1 : Math.max(current - 1, 0);
+  selectRow(rows[index].id, true, true);
 }
 
 function renderDetail() {
@@ -264,7 +299,8 @@ function renderDetail() {
   $("rowDetail").hidden = !row;
   if (!row) return;
   $("detailTitle").textContent = `Roll ${row.roll || "—"}`;
-  $("rowProvenance").textContent = row.method === "Manual" ? "Manually added row · No original cell recorded" : `Page ${row.page} · ${row.method} · Original: ${row.raw_roll || "(blank)"} → ${row.raw_mark || "(blank)"}`;
+  const score = row.method === "Local OCR" ? ` · OCR confidence ${Number(row.confidence ?? 0).toFixed(2)}${isLowConfidence(row) ? " (low)" : ""}` : "";
+  $("rowProvenance").textContent = row.method === "Manual" ? "Manually added row · No original cell recorded" : `Page ${row.page} · ${row.method} · Original: ${row.raw_roll || "(blank)"} → ${row.raw_mark || "(blank)"}${score}`;
   $("rowIssues").hidden = !row.issues.length;
   $("rowIssues").textContent = row.issues.join(" · ");
   $("reviewState").innerHTML = icon(row.issues.length ? "flag" : "check-circle") + (row.issues.length ? "Check the highlighted issues" : row.reviewed ? "Verified by you" : "No validation issues");
@@ -274,13 +310,46 @@ function renderDetail() {
   drawCrop();
 }
 
+function renderMarkCandidates(page) {
+  const select = $("markCandidateSelect");
+  const layout = state.drafts.get(state.page) || page.layout;
+  const candidates = page.mark_candidates || [];
+  select.innerHTML = "";
+  for (const candidate of candidates) {
+    const option = document.createElement("option");
+    option.value = candidate.id;
+    option.textContent = `${candidate.label}${candidate.max_mark != null ? ` · max ${candidate.max_mark}` : ""}`;
+    option.title = candidate.label;
+    select.append(option);
+  }
+  let selected = candidates.find(candidate => layout
+    && Math.abs(candidate.left - layout.mark[0]) < .003 && Math.abs(candidate.right - layout.mark[1]) < .003);
+  if (!selected && layout) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = `Custom: ${layout.label || "selection"}`;
+    select.append(option);
+    select.value = "";
+  } else if (selected) {
+    select.value = selected.id;
+  }
+  if (!candidates.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = layout?.label || "No columns detected";
+    select.append(option);
+  }
+  select.disabled = state.mutating || !layout;
+  $("columnBadge").textContent = layout?.automatic ? "AUTO-DETECTED" : layout ? "CUSTOM" : "NO COLUMN";
+}
+
 function renderPage() {
   const page = currentPage();
   if (!page) return;
   $("pageSelect").value = state.page;
   $("prevPage").disabled = state.page <= 1;
   $("nextPage").disabled = state.page >= state.doc.page_count;
-  $("columnLabel").textContent = (state.drafts.get(state.page) || page.layout)?.label || "Select columns";
+  renderMarkCandidates(page);
   $("sourceMethod").innerHTML = '<span class="status-dot"></span>' + escapeHTML(page.method);
   const image = $("pageImage");
   image.alt = `Original marksheet, page ${page.number} of ${state.doc.page_count}`;
@@ -341,6 +410,7 @@ function drawCrop() {
 function setMutationState() {
   const ready = state.doc?.status === "ready";
   for (const id of ["addRow","editRow","selectRoll","selectMark","applyAll","applyPage","resetColumns","saveRow","chooseColumns"]) $(id).disabled = state.mutating || !ready;
+  $("markCandidateSelect").disabled = state.mutating || !currentPage()?.layout;
   $("exportExcel").disabled = state.mutating || state.exporting || !ready || !state.doc?.row_count || !!state.drafts.size;
   $("exportCSV").disabled = $("exportExcel").disabled;
   $("savedState").classList.toggle("saving", state.mutating || !!state.drafts.size);
@@ -415,6 +485,14 @@ async function reextract(scope) {
     const doc = await mutate("reextract", {page:state.page,scope,layout:scope === "auto" ? null : layout},"POST","Results updated from the source.");
     if (doc) { if (all) state.drafts.clear(); else state.drafts.delete(state.page); state.selection = null; renderPage(); }
   } catch (error) { toast(error.message,true); }
+}
+
+async function verifyRowById(id) {
+  const row = state.doc?.records.find(record => record.id === id);
+  if (!row || state.mutating || state.doc?.status !== "ready") return;
+  if (row.reviewed) { toast("This row is already reviewed."); return; }
+  try { await mutate(`rows/${row.id}`,{roll:row.roll,mark:row.mark,reviewed:true},"PATCH","Reading verified. Any remaining validation issues still need correction."); }
+  catch (error) { toast(error.message,true); }
 }
 
 function showEdit(id = null) {
@@ -508,30 +586,73 @@ $("pageImage").onerror = () => toast("Could not load the source page. Check that
 new ResizeObserver(resizePreview).observe($("pageViewport"));
 $("filterAll").onclick = () => { state.filter = "all"; renderRows(); };
 for (const id of ["filterReview","reviewShortcut"]) $(id).onclick = () => { state.filter = "review"; renderRows(); };
+$("filterConfidence").onclick = () => { state.filter = "confidence"; renderRows(); };
+$("sortRows").onchange = event => { state.sort = event.target.value; renderRows(); };
+$("markCandidateSelect").onchange = event => {
+  const page = currentPage();
+  const candidate = (page?.mark_candidates || []).find(item => item.id === event.target.value);
+  if (!candidate) return;
+  const layout = clone(state.drafts.get(state.page) || page.layout || {roll:[.05,.2],mark:[.8,.95],top:0,bottom:1,label:"Custom marks column",max_mark:null,automatic:false});
+  layout.mark = [candidate.left, candidate.right];
+  layout.top = candidate.top; layout.bottom = candidate.bottom;
+  layout.label = candidate.label; layout.max_mark = candidate.max_mark; layout.automatic = false;
+  state.drafts.set(state.page, layout); state.selection = null;
+  renderPage(); setMutationState();
+  toast(`Marks column set to ${candidate.label}. Re-extract this page or apply it to all pages.`);
+};
 $("searchInput").oninput = event => { state.query = event.target.value.trim(); renderRows(); };
-$("tableBody").onclick = event => { const edit = event.target.closest("[data-edit]"), row = event.target.closest("[data-row]"); if (row) selectRow(row.dataset.row); if (edit) showEdit(edit.dataset.edit); };
+$("tableBody").onclick = event => {
+  const verify = event.target.closest("[data-verify]"), edit = event.target.closest("[data-edit]"), row = event.target.closest("[data-row]");
+  if (row) selectRow(row.dataset.row);
+  if (verify) verifyRowById(verify.dataset.verify);
+  if (edit) showEdit(edit.dataset.edit);
+};
 $("tableBody").ondblclick = event => { const row = event.target.closest("[data-row]"); if (row) showEdit(row.dataset.row); };
-$("tableBody").onkeydown = event => { const row = event.target.closest("[data-row]"); if (row && event.key === "Enter") { event.preventDefault(); selectRow(row.dataset.row); } };
+$("tableBody").onkeydown = event => {
+  const row = event.target.closest("[data-row]");
+  if (row && event.key === "Enter" && !event.target.closest("button, input, select, a")) {
+    event.preventDefault();
+    if (state.selected !== row.dataset.row) selectRow(row.dataset.row);
+    verifyRowById(row.dataset.row);
+  }
+};
 $("editRow").onclick = () => showEdit();
 $("addRow").onclick = () => showEdit("new");
 $("closeEdit").onclick = () => $("editDialog").close();
-$("verifyRow").onclick = async () => { const row = currentRow(); if (!row) return; try { await mutate(`rows/${row.id}`,{roll:row.roll,mark:row.mark,reviewed:true},"PATCH","Reading verified. Any remaining validation issues still need correction."); } catch(error) { toast(error.message,true); } };
-$("settingsForm").onsubmit = async event => { event.preventDefault(); const input = $("maxMark").value; try { await mutate("settings",{max_mark:input === "" ? null : Number(input)},"PATCH","Mark range checked across all pages."); } catch(error) { toast(error.message,true); } };
+$("verifyRow").onclick = () => { const row = currentRow(); if (row) verifyRowById(row.id); };
+$("settingsForm").onsubmit = async event => {
+  event.preventDefault();
+  const input = $("maxMark").value;
+  const codes = $("absentCodes").value.split(",").map(code => code.trim()).filter(Boolean);
+  try { await mutate("settings",{max_mark:input === "" ? null : Number(input),absent_codes:codes,allow_fractions:$("allowFractions").checked},"PATCH","Validation settings saved."); }
+  catch(error) { toast(error.message,true); }
+};
 
 window.addEventListener("dragover",event => { if (event.dataTransfer.types.includes("Files")) { event.preventDefault(); document.body.classList.add("is-dragging"); } });
 window.addEventListener("dragleave",event => { if (!event.relatedTarget) document.body.classList.remove("is-dragging"); });
 window.addEventListener("drop",event => { event.preventDefault(); document.body.classList.remove("is-dragging"); if (event.dataTransfer.files.length) importFile(event.dataTransfer.files[0]); });
 document.addEventListener("keydown",event => {
   if (document.querySelector("dialog[open]")) return;
-  const typing = event.target.matches("input,textarea,[contenteditable]");
+  const typing = event.target.matches("input,textarea,select,[contenteditable]");
   if (event.key === "Escape") { state.selection = null; state.drag = null; $("moreMenu").hidden = true; renderPage(); }
   if (event.key === "/" && !typing && state.doc?.status === "ready") { event.preventDefault(); $("searchInput").focus(); }
+  const position = {ArrowDown:"next",ArrowUp:"previous",Home:"first",End:"last"}[event.key];
+  if (position && !typing && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && state.doc?.status === "ready") {
+    event.preventDefault();
+    moveSelection(position);
+  }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "e" && state.doc?.status === "ready") { event.preventDefault(); exportFile("xlsx"); }
+  if (event.key.toLowerCase() === "r" && !typing && !event.ctrlKey && !event.metaKey && !event.altKey && state.doc?.status === "ready") {
+    const row = currentRow();
+    if (row && !row.reviewed) { event.preventDefault(); verifyRowById(row.id); }
+  }
 });
 
 async function initialize() {
   try {
-    await api("/api/health"); await refreshLibrary();
+    const health = await api("/api/health");
+    state.lowConfidence = Number(health.low_confidence_threshold) || .7;
+    await refreshLibrary();
     const examples = await api("/api/examples");
     $("examplesSection").hidden = !examples.length;
     $("exampleList").innerHTML = examples.map(example => `<button class="example-card" data-example="${example.id}"><span class="example-icon">${icon("file")}</span><span class="example-copy"><strong>${escapeHTML(example.title)}</strong><small>${escapeHTML(example.description)}</small></span><span>${icon("arrow-up-right")}</span></button>`).join("");
